@@ -1,0 +1,789 @@
+/************* CONFIG *************/
+const SHEET_SOURCE = 'SourceData';
+const SHEET_TRACKER = 'LeadTracker';
+const SHEET_NOT_PICKED = 'Not Call Picked Leads';
+
+const SALES_PERSONS = ['Lucky','Ayush'];   // order matters
+const DISTRIBUTION = [0.5, 0.5];              // new leads distribution
+const LEAD_ID_PREFIX = 'L';                         // e.g., L0001
+const LEAD_ID_PAD = 4;                              // L0001, L0002, ...
+/**********************************/
+
+function norm_(v){ return (v==null?'':String(v)).trim().toLowerCase(); }
+function colmap_(hdr) {
+  const map = {};
+  hdr.forEach((h, i) => {
+    const key = String(h || '').trim().toLowerCase().replace(/,/g, '');
+    // Original columns
+    if (key === "call status") map["call status"] = i;
+    if (key === "calling date") map["calling date"] = i;
+    if (key === "lead status") map["lead status"] = i;
+    if (key === "lead id") map["lead id"] = i;
+    if (key === "name") map["name"] = i;
+    if (key === "phone") map["phone"] = i;
+    if (key === "sales person") map["sales person"] = i;
+    if ( key === "date") map["date"] = i; // This will match 'Date', 'DATE', etc.
+    if (key === "per hr shoot" || key === "perhrshoot" || key === "per hour shoot") map["per hr shoot"] = i;
+    if (key === "content you are planing") map["content you are planing"] = i;
+    if (key === "do you need editing services") map["do you need editing services"] = i;
+    if (key === "allocation date") map["allocation date"] = i;
+    if (key === "allocation count") map["allocation count"] = i;
+
+
+
+    // Remark & Date numbered columns (now up to 10)
+    for (let n = 1; n <= 10; n++) {
+      if (key === `remark ${n}`) map[`remark ${n}`] = i;
+      if (key === `date ${n}`) map[`date ${n}`] = i;
+      if (key === `call status ${n}`) map[`call status ${n}`] = i;
+      if (key === `lead quality ${n}`) map[`lead quality ${n}`] = i;
+    }
+  });
+  return map;
+}
+
+
+
+
+/* ---- SAFE UI (prevents "Cannot call getUi()" error) ---- */
+function getUiSafe_() {
+  try { return SpreadsheetApp.getUi(); } catch(e){ return null; }
+}
+
+/* ---- Menu (runs only if UI exists) ---- */
+// function onOpen(){
+//   const ui = getUiSafe_();
+//   if (!ui) return; // headless context (trigger/IDE) -> skip quietly
+//   ui.createMenu('Lead Tools')
+//     .addItem('Distribute NEW (Source ➜ Tracker)', 'distributeNewLeads')
+//     .addItem('Sweep to Not-Picked (move + delete)', 'sweepNotPicked')
+//     .addSeparator()
+//     .addItem('Old Leads: Distribute', 'runBoth')
+//     .addSeparator()
+//     .addItem('Create Daily Trigger 10:00 (skip Sun)', 'createDailyTrigger')
+//     .addToUi();
+// }
+
+function onOpen() {
+  const ui = getUiSafe_();
+  if (!ui) return;
+
+  ui.createMenu('Lead Tools')
+    .addItem('Distribute NEW (Source ➜ Tracker)', 'distributeNewLeads')
+    .addItem('Sweep to Not-Picked (move + delete)', 'sweepNotPicked')
+    .addSeparator()
+    .addItem('Old Leads: Distribute', 'runBoth')
+    .addSeparator()
+    .addSubMenu(
+      ui.createMenu('Setup Triggers')
+        .addItem('Set Distribute Trigger', 'setupTriggerDistribute')
+        .addItem('Set Sweep Trigger', 'setupTriggerSweep')
+        .addItem('Set Old Leads Trigger', 'setupTriggerRunBoth')
+    )
+    .addToUi();
+}
+
+function setupTriggerDistribute() {
+  const ui = SpreadsheetApp.getUi();
+  const resp = ui.prompt('Set Distribute Trigger', 'Enter time in HH:MM format (24hr clock):', ui.ButtonSet.OK_CANCEL);
+  if (resp.getSelectedButton() !== ui.Button.OK) return;
+
+  const timeParts = resp.getResponseText().trim().split(':');
+  const hour = parseInt(timeParts[0], 10);
+  const minute = parseInt(timeParts[1] || '0', 10);
+
+  if (isNaN(hour) || hour < 0 || hour > 23 || isNaN(minute) || minute < 0 || minute > 59) {
+    ui.alert('❌ Invalid time. Use 24hr format like 10:00 or 17:45');
+    return;
+  }
+
+  // Remove old trigger
+  ScriptApp.getProjectTriggers().forEach(t => {
+    if (t.getHandlerFunction() === 'dailyDistributeJob_') ScriptApp.deleteTrigger(t);
+  });
+
+  // Set new trigger (only hour supported)
+  ScriptApp.newTrigger('dailyDistributeJob_').timeBased().atHour(hour).everyDays(1).create();
+
+  ui.alert(`✅ Distribute trigger set for ${hour}:00 (minutes not supported by Apps Script, skipping Sundays).`);
+}
+
+function setupTriggerSweep() {
+  const ui = SpreadsheetApp.getUi();
+  const resp = ui.prompt('Set Sweep Trigger', 'Enter time in HH:MM format (24hr clock):', ui.ButtonSet.OK_CANCEL);
+  if (resp.getSelectedButton() !== ui.Button.OK) return;
+
+  const timeParts = resp.getResponseText().trim().split(':');
+  const hour = parseInt(timeParts[0], 10);
+  const minute = parseInt(timeParts[1] || '0', 10);
+
+  if (isNaN(hour) || hour < 0 || hour > 23 || isNaN(minute) || minute < 0 || minute > 59) {
+    ui.alert('❌ Invalid time. Use 24hr format like 10:00 or 17:45');
+    return;
+  }
+
+  ScriptApp.getProjectTriggers().forEach(t => {
+    if (t.getHandlerFunction() === 'dailySweepJob_') ScriptApp.deleteTrigger(t);
+  });
+
+  ScriptApp.newTrigger('dailySweepJob_').timeBased().atHour(hour).everyDays(1).create();
+
+  ui.alert(`✅ Sweep trigger set for ${hour}:00 (minutes not supported, skipping Sundays).`);
+}
+
+function setupTriggerRunBoth() {
+  const ui = SpreadsheetApp.getUi();
+  const resp = ui.prompt('Set Old Leads Trigger', 'Enter time in HH:MM format (24hr clock):', ui.ButtonSet.OK_CANCEL);
+  if (resp.getSelectedButton() !== ui.Button.OK) return;
+
+  const timeParts = resp.getResponseText().trim().split(':');
+  const hour = parseInt(timeParts[0], 10);
+  const minute = parseInt(timeParts[1] || '0', 10);
+
+  if (isNaN(hour) || hour < 0 || hour > 23 || isNaN(minute) || minute < 0 || minute > 59) {
+    ui.alert('❌ Invalid time. Use 24hr format like 10:00 or 17:45');
+    return;
+  }
+
+  ScriptApp.getProjectTriggers().forEach(t => {
+    if (t.getHandlerFunction() === 'dailyRunBothJob_') ScriptApp.deleteTrigger(t);
+  });
+
+  ScriptApp.newTrigger('dailyRunBothJob_').timeBased().atHour(hour).everyDays(1).create();
+
+  ui.alert(`✅ Old Leads trigger set for ${hour}:00 (minutes not supported, skipping Sundays).`);
+}
+
+
+
+
+/* ---- Detect SourceData columns (flex headers) ---- */
+function detectSourceCols_(srcHeaders){
+  const H = srcHeaders.map(h=>norm_(h));
+  function idxOf(keys){
+    for(const k of keys){ const i = H.indexOf(k); if(i>-1) return i; }
+    return -1;
+  }
+  return {
+    date:  idxOf(['date','lead date','submitted at']),
+    name:  idxOf(['full name','name']),
+    phone: idxOf(['phone','phone number','mobile','mobile number','contact']),
+    perHr: idxOf(['per hr shoot']),
+    content: idxOf(['content you are planing']),
+    editing: idxOf(['do you need editing services'])
+  };
+}
+
+function ensureNotPickedSheet_(){
+  const ss = SpreadsheetApp.getActive();
+  let np = ss.getSheetByName(SHEET_NOT_PICKED);
+  if(!np){
+    const tr = ss.getSheetByName(SHEET_TRACKER);
+    if(!tr) throw new Error('LeadTracker sheet missing.');
+    const hdr = tr.getRange(1,1,1,tr.getLastColumn()).getValues();
+    np = ss.insertSheet(SHEET_NOT_PICKED);
+    np.getRange(1,1,1,hdr[0].length).setValues(hdr); // if creating fresh, copy headers
+  }
+  return np;
+}
+
+/* 🔧 NEW: header helpers (support different column orders per sheet) */
+function getHeaderMap_(sheet){
+  if(!sheet) return null;
+  const lastCol = sheet.getLastColumn();
+  if(lastCol < 1) return null;
+  const hdr = sheet.getRange(1,1,1,lastCol).getValues()[0];
+  return { headers: hdr, cmap: colmap_(hdr) };
+}
+
+function getPrevAllocationCountInSheet_(phone, sheet){
+  if(!sheet) return 0;
+  const hm = getHeaderMap_(sheet);
+  if(!hm) return 0;
+  const phCol = hm.cmap['phone'];
+  const acCol = hm.cmap['allocation count'];
+  if(phCol==null || acCol==null) return 0;
+
+  const last = sheet.getLastRow();
+  if(last < 2) return 0;
+  const vals = sheet.getRange(2,1,last-1, sheet.getLastColumn()).getValues();
+
+  let maxCount = 0;
+  for(const r of vals){
+    const ph = String(r[phCol]||'').trim();
+    if(ph && ph === phone){
+      const c = parseInt(r[acCol]||'0',10);
+      if(c > maxCount) maxCount = c;
+    }
+  }
+  return maxCount;
+}
+
+function getPrevAllocationCountAcross_(phone, trk, np){
+  return Math.max(
+    getPrevAllocationCountInSheet_(phone, trk),
+    getPrevAllocationCountInSheet_(phone, np)
+  );
+}
+
+/* 🔧 Parse max numeric part from any sheet's "Lead ID" column */
+function getMaxLeadSeqFromSheet_(sheet, leadIdColZero){
+  if(!sheet) return 0;
+  const lastRow = sheet.getLastRow();
+  if(lastRow < 2) return 0;
+  const vals = sheet.getRange(2, leadIdColZero+1, lastRow-1, 1).getValues().flat();
+  let maxSeq = 0;
+  const re = new RegExp('^' + LEAD_ID_PREFIX.replace(/[-/\\^$*+?.()|[\]{}]/g, '\\$&') + '(\\d+)$');
+  for(const v of vals){
+    const s = String(v||'').trim();
+    const m = s.match(re);
+    if(m){
+      const n = parseInt(m[1], 10);
+      if(n > maxSeq) maxSeq = n;
+    }
+  }
+  return maxSeq;
+}
+
+/* 🔧 Compute the next starting sequence across BOTH sheets */
+function getNextLeadSeq_(trk, np, tmap){
+  const leadIdColZero = tmap['lead id'];
+  let maxSeq = 0;
+  maxSeq = Math.max(maxSeq, getMaxLeadSeqFromSheet_(trk, leadIdColZero));
+  maxSeq = Math.max(maxSeq, getMaxLeadSeqFromSheet_(np, leadIdColZero));
+  return maxSeq + 1; // next available
+}
+
+/* 🔧 format helper */
+function formatLeadId_(seq){
+  return LEAD_ID_PREFIX + Utilities.formatString('%0' + LEAD_ID_PAD + 'd', seq);
+}
+
+/* =============== A) DISTRIBUTE NEW ONLY ================= */
+function distributeNewLeads(){
+  const lock = LockService.getDocumentLock(); // prevent concurrent ID allocation clashes
+  lock.waitLock(20000); // up to 20s
+
+  try{
+    const ss = SpreadsheetApp.getActive();
+    const src = ss.getSheetByName(SHEET_SOURCE);
+    const trk = ss.getSheetByName(SHEET_TRACKER);
+    if(!src || !trk) throw new Error('SourceData or LeadTracker sheet missing.');
+
+    const srcVals = src.getDataRange().getValues();
+    if(srcVals.length < 2) return;
+
+    const trkVals = trk.getDataRange().getValues();
+    const trkHdr = trkVals[0];
+    const tmap = colmap_(trkHdr);
+
+    // ✅ require Allocation Count too
+    const need = [
+      'date','lead id','name','phone','per hr shoot','content you are planing','do you need editing services',
+      'allocation date','sales person','call status','calling date',
+      'remark 1','date 1','remark 2','date 2','remark 3','date 3',
+      'remark 4','date 4','remark 5','date 5',
+      'allocation count' // NEW
+    ];
+    for(const n of need){ if(tmap[n]==null) throw new Error('LeadTracker missing header: '+n); }
+
+    // detect source columns
+    const sHdr = srcVals[0];
+    const sidx = detectSourceCols_(sHdr);
+    if(sidx.phone === -1) throw new Error('SourceData: phone column not found.');
+
+    // existing phones (Active duplicates avoid) -> from Tracker only
+    const existing = new Set(trkVals.slice(1)
+      .map(r => String(r[tmap['phone']]||'').trim())
+      .filter(Boolean)
+    );
+
+    const fresh = [];
+    for(let i=1;i<srcVals.length;i++){
+      const r = srcVals[i];
+      const ph = String(r[sidx.phone]||'').trim();
+      if(!ph) continue;
+      if(!existing.has(ph)) fresh.push(r);
+    }
+    if(!fresh.length) return;
+
+    // 40/30/30 split
+    let total = fresh.length;
+    let counts = DISTRIBUTION.map(p=>Math.floor(p*total));
+    counts[0] += total - counts.reduce((a,b)=>a+b,0);
+
+    // Prepare next Lead ID sequence (across both sheets)
+    const np = ensureNotPickedSheet_();
+    let nextSeq = getNextLeadSeq_(trk, np, tmap);
+
+    const toAppend = [];
+    let k = 0;
+    for(let s=0; s<SALES_PERSONS.length; s++){
+      for(let j=0; j<counts[s]; j++){
+        const r = fresh[k++]; if(!r) break;
+
+        const phone = String(r[sidx.phone]||'').trim();
+        if(!phone) continue;
+
+        const row = new Array(trkHdr.length).fill('');
+        const id  = formatLeadId_(nextSeq++);
+
+        // ✅ previous allocations across BOTH sheets (irrespective of column letters)
+        const prevCount = getPrevAllocationCountAcross_(phone, trk, np);
+        const allocCount = (prevCount || 0) + 1;
+
+        row[tmap['date']]             = (sidx.date>-1 ? r[sidx.date] : new Date());
+        row[tmap['lead id']]          = id;
+        row[tmap['name']]             = (sidx.name>-1 ? r[sidx.name] : '');
+        row[tmap['phone']]            = phone;
+        row[tmap['per hr shoot']] = (sidx.perHr > -1 ? r[sidx.perHr] : '');
+        row[tmap['content you are planing']] = (sidx.content > -1 ? r[sidx.content] : '');
+        row[tmap['do you need editing services']] = (sidx.editing > -1 ? r[sidx.editing] : '');
+        row[tmap['allocation date']]  = Utilities.formatDate(new Date(), Session.getScriptTimeZone(), 'dd/MM/yyyy');   // today = distribute day
+        row[tmap['sales person']]     = SALES_PERSONS[s];
+        row[tmap['call status']]      = '';           // blank initially
+        row[tmap['calling date']]     = '';           // set on edit
+        row[tmap['allocation count']] = allocCount;   // ✅ write count (X via header name)
+
+        toAppend.push(row);
+      }
+    }
+
+    if(toAppend.length){
+      // Find the first empty row after the last row with data
+let lastRow = trk.getLastRow();
+while (lastRow > 0 && trk.getRange(lastRow, 1).isBlank()) {
+  lastRow--;
+}
+const start = lastRow + 1;
+trk.getRange(start, 1, toAppend.length, trkHdr.length).setValues(toAppend);
+
+    }
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+/* =============== B) SWEEP / REDISTRIBUTE ONLY =================
+   Rule: LeadTracker se woh saari rows jinka Call Status:
+   - BLANK ho, ya
+   - "Call Picked" ke ALAVA kuch bhi ho
+   -> "Not Call Picked Leads" sheet me move + LeadTracker se delete.
+
+   ✅ Header-based mapping so NP me column order different ho to bhi safe.
+*/
+function sweepNotPicked(){
+  const ss  = SpreadsheetApp.getActive();
+  const trk = ss.getSheetByName(SHEET_TRACKER);
+  const np  = ensureNotPickedSheet_();
+  if(!trk || !np) return;
+
+  const trkHM = getHeaderMap_(trk);
+  const npHM  = getHeaderMap_(np);
+  if(!trkHM || !npHM) return;
+
+  const H = trkHM.headers;
+  const cmap = trkHM.cmap;
+  const statusCol = cmap['call status'];
+  if(statusCol==null) return;
+
+  const data = trk.getDataRange().getValues();
+  if (data.length < 2) return;
+
+  // pick rows (blank OR not "call picked")
+  const rowsToMoveIdx = [];
+  const rowsToAppendMapped = [];
+
+  for (let i = 1; i < data.length; i++) {
+    const r  = data[i];
+    const st = (String(r[statusCol]||'').trim().toLowerCase());
+    if (st === '' || st !== 'call picked') {
+      rowsToMoveIdx.push(i + 1);
+
+      // map by header name from Tracker → NotPicked
+      const out = new Array(np.getLastColumn()).fill('');
+      for(const [name, npIdx] of Object.entries(npHM.cmap)){
+        const trkIdx = cmap[name];
+        if(trkIdx != null){
+          out[npIdx] = r[trkIdx];
+        }
+      }
+      rowsToAppendMapped.push(out);
+    }
+  }
+
+  // append to Not Picked (mapped)
+  if (rowsToAppendMapped.length) {
+    const startNP = np.getLastRow() + 1;
+    np.getRange(startNP, 1, rowsToAppendMapped.length, np.getLastColumn())
+      .setValues(rowsToAppendMapped);
+  }
+
+  // delete from LeadTracker in reverse
+  for (let i = rowsToMoveIdx.length - 1; i >= 0; i--) {
+    trk.deleteRow(rowsToMoveIdx[i]);
+  }
+}
+
+// /* =============== C) RUN BOTH ================= */
+// function runBoth(){
+//   distributeNewLeads();
+// }
+
+/* =============== D) DAILY TRIGGER =================
+   10 AM IST, skip Sunday (0 = Sunday)
+*/
+function createDailyTrigger(){
+  // clear old trigger
+  ScriptApp.getProjectTriggers().forEach(t=>{
+    if(['dailyDistributeJob_','dailySweepJob_'].includes(t.getHandlerFunction())){
+      ScriptApp.deleteTrigger(t);
+    }
+  });
+  // You can choose to set only distribute OR both:
+  ScriptApp.newTrigger('dailyDistributeJob_').timeBased().atHour(10).everyDays(1).create();
+  // If you also want auto sweep daily, uncomment the next line:
+  // ScriptApp.newTrigger('dailySweepJob_').timeBased().atHour(10).everyDays(1).create();
+}
+
+function dailyDistributeJob_(){
+  const d = new Date();
+  if(d.getDay() === 0) return; // skip Sunday
+  distributeNewLeads();
+}
+
+function dailySweepJob_(){
+  const d = new Date();
+  if(d.getDay() === 0) return; // skip Sunday
+  sweepNotPicked();
+}
+
+/* =============== E) ON EDIT STAMPS =================
+   - Call Status edited (non-empty) -> Calling Date = now
+   - Remark 1 edited (non-empty) -> Date 1 = now
+   - Remark 2 edited (non-empty) -> Date 2 = now
+   - ... up to Remark 5 / Date 5
+*/
+// function onEdit(e){
+//   try{
+//     const sh = e.range.getSheet();
+//     if(sh.getName() !== SHEET_TRACKER) return;
+
+//     const hdr = sh.getRange(1,1,1, sh.getLastColumn()).getValues()[0];
+//     const cmap = colmap_(hdr);
+//     const r = e.range.getRow();
+//     const c = e.range.getColumn();
+//     if(r === 1) return;
+
+//     const statusC   = (cmap['call status']||0)+1;
+//     const callDateC = (cmap['calling date']||0)+1;
+//     const rem1C     = (cmap['remark 1']||0)+1;
+//     const date1C    = (cmap['date 1']||0)+1;
+//     const rem2C     = (cmap['remark 2']||0)+1;
+//     const date2C    = (cmap['date 2']||0)+1;
+//     const rem3C     = (cmap['remark 3']||0)+1;
+//     const date3C    = (cmap['date 3']||0)+1;
+//     const rem4C     = (cmap['remark 4']||0)+1;
+//     const date4C    = (cmap['date 4']||0)+1;
+//     const rem5C     = (cmap['remark 5']||0)+1;
+//     const date5C    = (cmap['date 5']||0)+1;
+
+//     if(c === statusC){
+//       const v = norm_(e.range.getValue());
+//       if(v !== '') sh.getRange(r, callDateC).setValue(new Date());
+//     }
+//     if(c === rem1C){
+//       const v = sh.getRange(r, rem1C).getValue();
+//       if(String(v).trim() !== '') sh.getRange(r, date1C).setValue(new Date());
+//     }
+//     if(c === rem2C){
+//       const v = sh.getRange(r, rem2C).getValue();
+//       if(String(v).trim() !== '') sh.getRange(r, date2C).setValue(new Date());
+//     }
+//     if(c === rem3C){
+//       const v = sh.getRange(r, rem3C).getValue();
+//       if(String(v).trim() !== '') sh.getRange(r, date3C).setValue(new Date());
+//     }
+//     if(c === rem4C){
+//       const v = sh.getRange(r, rem4C).getValue();
+//       if(String(v).trim() !== '') sh.getRange(r, date4C).setValue(new Date());
+//     }
+//     if(c === rem5C){
+//       const v = sh.getRange(r, rem5C).getValue();
+//       if(String(v).trim() !== '') sh.getRange(r, date5C).setValue(new Date());
+//     }
+//   }catch(err){
+//     // ignore silent errors
+//   }  
+ 
+// }
+
+function handleEdit(e) {
+  try {
+    const sh = e.range.getSheet();
+    if (sh.getName() !== 'LeadTracker') return;
+    const hdr = sh.getRange(1, 1, 1, sh.getLastColumn()).getValues()[0];
+    const cmap = colmap_(hdr);
+    const r = e.range.getRow();
+    const c = e.range.getColumn();
+    const __d = Utilities.formatDate(new Date(), Session.getScriptTimeZone(), 'dd/MM/yyyy');
+    if (r === 1) return; // Skip header row
+
+    // Loop through all possible remark columns (1-10)
+    for (let n = 1; n <= 10; n++) {
+      const remarkCol = (cmap[`remark ${n}`] || 0) + 1;
+      const dateCol = (cmap[`date ${n}`] || 0) + 1;
+      if (c === remarkCol) {
+        const v = sh.getRange(r, remarkCol).getValue();
+        if (String(v).trim() !== '') {
+          sh.getRange(r, dateCol).setValue(__d);
+        }
+        break; // Exit loop after handling the edit
+      }
+    }
+
+    // Handle Call Status updates
+    const statusC = (cmap['call status'] || 0) + 1;
+    const callDateC = (cmap['calling date'] || 0) + 1;
+    if (c === statusC) {
+      const v = norm_(e.range.getValue());
+      if (v !== '') sh.getRange(r, callDateC).setValue(new Date());
+    }
+
+    // Handle "Connected" status (copy your existing logic here)
+    const leadStatusC = (cmap['lead status'] || 0) + 1;
+    if (c === leadStatusC) {
+      const statusVal = norm_(e.range.getValue());
+      if (statusVal === 'connected') {
+        const rowVals = sh.getRange(r, 1, 1, sh.getLastColumn()).getValues()[0];
+        const leadId = rowVals[cmap['lead id']] || '';
+        if (!leadId) return;
+        const clientId = 'C' + String(leadId);
+        const clientName = rowVals[cmap['name']] || '';
+        const phone = rowVals[cmap['phone']] || '';
+        const salesPerson = rowVals[cmap['sales person']] || '';
+        const connectedDate = new Date();
+        const ss = SpreadsheetApp.getActive();
+        const clientsSheet = ss.getSheetByName('Clients');
+        if (!clientsSheet) return;
+        const ch = clientsSheet.getRange(1, 1, 1, clientsSheet.getLastColumn()).getValues()[0].map(h => h.toLowerCase());
+        const cidCol = ch.indexOf('client id');
+        const nameCol = ch.indexOf('client name');
+        const phoneCol = ch.indexOf('phone');
+        const spCol = ch.indexOf('sales person');
+        const dateCol = ch.indexOf('connected date');
+        const out = new Array(clientsSheet.getLastColumn()).fill('');
+        if (cidCol > -1) out[cidCol] = clientId;
+        if (nameCol > -1) out[nameCol] = clientName;
+        if (phoneCol > -1) out[phoneCol] = phone;
+        if (spCol > -1) out[spCol] = salesPerson;
+        if (dateCol > -1) out[dateCol] = connectedDate;
+        clientsSheet.appendRow(out);
+      }
+    }
+  } catch (err) {
+    Logger.log('Error in handleEdit: ' + err.toString());
+  }
+}
+
+
+
+
+/* =============== (OPTIONAL) BACKFILL =================
+   Purane rows jinke Allocation Count blank hain, unhe fill karne ke liye
+*/
+function backfillAllocationCounts(){
+  const ss  = SpreadsheetApp.getActive();
+  const trk = ss.getSheetByName(SHEET_TRACKER);
+  const np  = ss.getSheetByName(SHEET_NOT_PICKED);
+  if(!trk) throw new Error('LeadTracker missing.');
+
+  const H = trk.getRange(1,1,1,trk.getLastColumn()).getValues()[0];
+  const cmap = colmap_(H);
+  const phC = cmap['phone'], acC = cmap['allocation count'];
+  if(phC==null || acC==null) throw new Error('Add "Allocation Count" header first.');
+
+  const last = trk.getLastRow();
+  if(last < 2) return;
+  const rng = trk.getRange(2,1,last-1,trk.getLastColumn());
+  const vals = rng.getValues();
+
+  for(let i=0;i<vals.length;i++){
+    const phone = String(vals[i][phC]||'').trim();
+    if(!phone) continue;
+    const prev = getPrevAllocationCountAcross_(phone, trk, np);
+    const current = parseInt(vals[i][acC]||'0',10);
+    if(!current){
+      vals[i][acC] = Math.max(prev,1); // at least 1 if present in tracker
+    }
+  }
+  rng.setValues(vals);
+}
+
+
+/************* CLIENTS AUTO-ADD (Installable onEdit bridge) *************/
+
+/**
+ * Run once to install an EDIT trigger that calls bridgeOnEdit_ on every edit.
+ * Isse tumhare existing simple onEdit(e) ko chhedna nahi padega.
+ */
+function installLeadBridgeTrigger_(){
+  // Delete any old triggers of same handler
+  ScriptApp.getProjectTriggers().forEach(t=>{
+    if(t.getHandlerFunction() === 'bridgeOnEdit_'){
+      ScriptApp.deleteTrigger(t);
+    }
+  });
+  ScriptApp.newTrigger('bridgeOnEdit_')
+    .forSpreadsheet(SpreadsheetApp.getActive())
+    .onEdit()
+    .create();
+}
+
+/**
+ * Installable onEdit bridge — LeadTracker me "connected" hone par Clients tab update.
+ */
+function bridgeOnEdit_(e){
+  try{
+    if(!e || !e.range || !e.source) return;
+    const ss = e.source;
+    const sh = e.range.getSheet();
+    if(!sh) return;
+
+    // Sheet names from your config constants
+    const LT = typeof SHEET_TRACKER !== 'undefined' ? SHEET_TRACKER : 'LeadTracker';
+    if(sh.getName() !== LT) return; // Only react in LeadTracker
+
+    // Read headers + col map
+    const lastCol = sh.getLastColumn();
+    if(lastCol < 1) return;
+    const headers = sh.getRange(1,1,1,lastCol).getValues()[0];
+    const cmap = colmap_(headers);  // uses your existing colmap_ helper
+
+    const row = e.range.getRow();
+    if(row < 2) return;
+
+    // Columns we need (case-insensitive)
+    const cStatusC = cmap['call status'];
+    const leadIdC  = cmap['lead id'];
+    const nameC    = cmap['name'] || cmap['lead name'] || cmap['client name'];
+    const phoneC   = cmap['phone'] || cmap['phone number'] || cmap['mobile'];
+    const salesC   = cmap['salesperson'] || cmap['sales person'] || cmap['assigned to'];
+
+    if([cStatusC, leadIdC].some(v=>v==null)) return; // required
+
+    // Row data
+    const rowVals = sh.getRange(row,1,1,lastCol).getValues()[0];
+    const status  = String(rowVals[cStatusC]||'').trim().toLowerCase();
+
+    // Only on "connected"
+    if(status !== 'connected') return;
+
+    const leadId  = String(rowVals[leadIdC]||'').trim();
+    if(!leadId) return;
+
+    const clientId = 'C' + leadId;
+    const name     = nameC!=null ? rowVals[nameC] : '';
+    const phone    = phoneC!=null ? rowVals[phoneC] : '';
+    const sales    = salesC!=null ? rowVals[salesC] : '';
+
+    // Upsert into Clients sheet
+    const csName = 'Clients';
+    const cs = ss.getSheetByName(csName) || ss.insertSheet(csName);
+    const cLastCol = Math.max(6, cs.getLastColumn());
+    const Cheaders = cs.getRange(1,1,1,cLastCol).getValues()[0];
+
+    // Ensure headers exist (idempotent)
+    const need = ['client id','lead id','client name','phone','salesperson','connected date'];
+    const cmapC = colmap_(Cheaders);
+    need.forEach((h,i)=>{
+      if(cmapC[h]==null){
+        cs.getRange(1, cLastCol + i + 1).setValue(h.replace(/\b\w/g,m=>m.toUpperCase()));
+      }
+    });
+
+    // Refresh header map (in case we extended)
+    const H2 = cs.getRange(1,1,1,cs.getMaxColumns()).getValues()[0];
+    const cm2 = colmap_(H2);
+    const CID = cm2['client id'], LID = cm2['lead id'], CN = cm2['client name'],
+          PH  = cm2['phone'],     SP  = cm2['salesperson'], CD = cm2['connected date'];
+
+    if([CID,LID,CN,PH,SP,CD].some(v=>v==null)){
+      throw new Error('Clients headers missing; ensure: Client ID, Lead ID, Client Name, Phone, Salesperson, Connected Date');
+    }
+
+    // Find existing by Client ID
+    const lastRow = cs.getLastRow();
+    let foundR = -1;
+    if(lastRow >= 2){
+      const rng = cs.getRange(2, CID+1, lastRow-1, 1).getValues(); // Client ID col only
+      for(let i=0;i<rng.length;i++){
+        if(String(rng[i][0]).trim() === clientId){
+          foundR = 2 + i;
+          break;
+        }
+      }
+    }
+
+    const now = new Date();
+    if(foundR === -1){
+      // append new
+      cs.appendRow(Array(Math.max(CD,4)+1).fill('')); // safe widen
+      const r = cs.getLastRow();
+      cs.getRange(r, CID+1).setValue(clientId);
+      cs.getRange(r, LID+1).setValue(leadId);
+      cs.getRange(r, CN+1 ).setValue(name);
+      cs.getRange(r, PH+1 ).setValue(phone);
+      cs.getRange(r, SP+1 ).setValue(sales);
+      cs.getRange(r, CD+1 ).setValue(now);
+    }else{
+      // update fields if changed
+      cs.getRange(foundR, CN+1 ).setValue(name);
+      cs.getRange(foundR, PH+1 ).setValue(phone);
+      cs.getRange(foundR, SP+1 ).setValue(sales);
+      if(!cs.getRange(foundR, CD+1).getValue()){
+        cs.getRange(foundR, CD+1).setValue(now);
+      }
+    }
+  }catch(err){
+    // optional: Logger.log(err);
+  }
+}
+
+function onEditSourceDataDate(e) {
+  try {
+    const sh = e.range.getSheet();
+    if (sh.getName() !== SHEET_SOURCE) return; // Only run for SourceData
+
+    const hdr = sh.getRange(1, 1, 1, sh.getLastColumn()).getValues()[0];
+    const cmap = colmap_(hdr);
+    const dateCol = (cmap['date'] || 0) + 1; // Get the column index for 'date'
+    if (!dateCol) return; // Skip if 'date' column doesn't exist
+
+    const editedRow = e.range.getRow();
+    if (editedRow === 1) return; // Skip header row
+
+    // Stamp the current date in the 'date' column for the edited row
+    const dateValue = Utilities.formatDate(new Date(), Session.getScriptTimeZone(), 'dd/MM/yyyy');
+    sh.getRange(editedRow, dateCol).setValue(dateValue);
+  } catch (err) {
+    Logger.log('Error in onEditSourceDataDate: ' + err.toString());
+  }
+}
+
+function installSourceDataDateTrigger() {
+  // Delete any old triggers of the same handler
+  ScriptApp.getProjectTriggers().forEach(t => {
+    if (t.getHandlerFunction() === 'onEditSourceDataDate') {
+      ScriptApp.deleteTrigger(t);
+    }
+  });
+
+  // Create a new onEdit trigger for SourceData
+  ScriptApp.newTrigger('onEditSourceDataDate')
+    .forSpreadsheet(SpreadsheetApp.getActive())
+    .onEdit()
+    .create();
+}
+
+
