@@ -61,10 +61,3 @@ lead-tracker-automation/
     └── sample_leads.csv   # fabricated sample rows for local testing
 ```
 
-## Privacy note
-
-This repo contains **no real lead data** — no names, phone numbers, or call remarks. `demo-data/sample_leads.csv` is entirely fabricated for demonstration purposes. The production Sheet this code runs against is private.
-
-## License
-
-MIT — see [`LICENSE`](LICENSE).
