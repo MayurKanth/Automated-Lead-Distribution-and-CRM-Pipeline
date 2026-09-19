@@ -52,8 +52,6 @@ Master working sheet. One row per lead; one column group per follow-up attempt (
 | Lead Status | Text | e.g. `Busy`, `Converted`, `Dead` |
 | Allocation Count | Number | Times this lead has been re-allocated |
 
-## `Karan_Leads` / rep-specific sheets
-Filtered subset of `LeadTracker` scoped to one sales rep, first follow-up round only (`Date` → `Remark`, no rounds 2–10). Used as that rep's working queue.
 
 ## `Not Call Picked Leads`
 Leads with no successful contact yet.
